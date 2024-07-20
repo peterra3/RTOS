@@ -1,0 +1,186 @@
+/* The KCD Task Template File */
+
+#define DEBUG_KCD
+#ifdef DEBUG_KCD
+#include "printf.h"
+#define DEBUG_PRINT(fmt, ...) printf("[DEBUG] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+#endif /* ! DEBUG_KCD */
+
+#include "kcd_task.h"
+
+void kcd_task(void)
+{
+	if (mbx_create(KCD_MBX_SIZE) != RTX_OK) {
+#ifdef DEBUG_KCD1
+		printf("[FATAL] %s(%d): kcd_task mailbox creation failed.\r\n", __FILE__, __LINE__);
+#endif /* ! DEBUG_0 */
+		return;
+	}
+
+	/*
+	*  Map ASCII decimals (index) to tids (value).
+	*  We use:
+	*  a) 48 to 57 for 0 to 9,
+	*  b) 65 to 89 for A to Z,
+	*  c) 91 to 122 for a to z.
+	*  Ignore all other identifiers.
+	*
+	*  If two tasks try to register the same
+	*  identifier, take the latest registration (overwrite)
+	*
+	*  If the identifier is greater than 1 character, ignore it.
+	*/
+	task_t identifier[123] = {0};
+
+	U8 command_string[64];      // At most 64 bytes, excludes first '%'
+	U32 msg_length = 0;         // KEY_IN queue, excludes first '%'
+	U8 is_new_msg = 0;			// Previous KEY_IN was 'enter' (ascii 10)
+	U8 is_valid_cmd = 0;		// First character was '%'     (ascii 37)
+
+	static U8 buffer[sizeof(RTX_MSG_HDR) + 1]; // Receive up to one character of data (maximum required by KEY_IN/KCD_REG)
+	task_t sender_tid = 0;
+
+#ifdef DEBUG_KCD
+		DEBUG_PRINT("kcd_task loop starting...", __FILE__, __LINE__);
+#endif /* ! DEBUG_0 */
+
+    while(1) {
+        int result = recv_msg(&sender_tid, buffer, sizeof(RTX_MSG_HDR) + 1);
+        if (result == RTX_ERR) continue; // mailbox is empty or next available message is not KEY_IN or KCD_REG which makes or buffer not big enough
+
+    	RTX_MSG_HDR* msg_hdr = (RTX_MSG_HDR*)buffer;
+
+    	// Cast input to U8 (32 bit processor -> 32 bit address) for addition
+    	// and then cast it back to a U8*
+    	// and then dereference
+    	// this variable is a number and a unsigned char at the same time, can be compared directly with a number
+    	// since ascii table has only 128 numbers
+    	U8 ascii = *((U8*)(((U32)buffer) + sizeof(RTX_MSG_HDR)));
+
+		switch (msg_hdr->type) {
+		case KEY_IN: {
+#ifdef DEBUG_KCD1
+		printf("[DEBUG] %s(%d): received KEY_IN...\r\n", __FILE__, __LINE__);
+#endif /* ! DEBUG_0 */
+
+			if (sender_tid != TID_UART_IRQ)
+				break;
+
+			if (ascii == 10) {
+				// Enter key pressed
+
+				task_t target_tid = identifier[(int)command_string[0]];
+				if (is_valid_cmd && msg_length <= 64) {
+					if (!msg_length || target_tid == 0 					// No identifier or identifier never registered
+							|| g_tcbs[target_tid].state == DORMANT) { 	// Registered task no longer alive
+
+						char error[28] = "Command cannot be processed";
+						send_putty_error(error, 27);
+
+						reset_state(&is_new_msg, &is_valid_cmd, &msg_length);
+						break;
+					}
+
+					// Copy command string into payload for sending
+					// PAYLOAD_SIZE includes the command identifier and data, excludes first '%'
+					U32 PAYLOAD_SIZE = sizeof(RTX_MSG_HDR) + msg_length;
+					U8 payload[PAYLOAD_SIZE];
+					RTX_MSG_HDR *msg_hdr = (RTX_MSG_HDR*) payload;
+					msg_hdr->type = KCD_CMD;
+					msg_hdr->length = PAYLOAD_SIZE;
+
+					my_memcpy(payload + sizeof(RTX_MSG_HDR), command_string, msg_length);
+
+					if (send_msg(target_tid, (void* )msg_hdr) != RTX_OK) {
+						char error[28] = "Command cannot be processed";
+						send_putty_error(error, 27);
+
+						// reset state
+						reset_state(&is_new_msg, &is_valid_cmd, &msg_length);
+						break;
+					}
+
+					// Reset state
+					is_valid_cmd = 0;
+					msg_length = 0;
+
+				} else {
+					char error[16] = "Invalid Command";
+					send_putty_error(error, 15);
+
+					reset_state(&is_new_msg, &is_valid_cmd, &msg_length);
+					break;
+				}
+			} else if (is_new_msg) {
+				is_valid_cmd = (ascii == 37);
+				is_new_msg = 0;
+			} else {
+				// Build command_string until limit + 1 (+1 to allow overflow detection, msg_length == 65)
+				if (is_valid_cmd && msg_length <= 64) {
+					command_string[msg_length] = ascii;
+					msg_length++;
+				}
+			}
+			break;
+		}
+
+		case KCD_REG: {
+#ifdef DEBUG_KCD1
+		printf("[DEBUG] %s(%s): received KCD_REG...\r\n", __FILE__, __LINE__);
+#endif /* ! DEBUG_0 */
+	    	/*
+	    	 * Command registration
+	    	 *
+	    	 * We should only register commands when
+	    	 * a) the size of the data is 1
+	    	 * b) the command is alphanumeric (0-9)(A-Z)(a-z)
+	    	 */
+			if (msg_hdr->length != sizeof(RTX_MSG_HDR) + 1 || !is_alphanumeric(ascii)) {
+				break; // Identifier not a single character (sizeof(1)) or not alphanumeric, ignore
+			}
+			identifier[ascii] = sender_tid;
+#ifdef DEBUG_KCD1
+		printf("[DEBUG] %s(%s): KCD_REG complete! Identifier: %c TID: %d\r\n", __FILE__, __LINE__, ascii, sender_tid);
+#endif /* ! DEBUG_0 */
+			break;
+		}
+		default: { // Ignore any other type
+			break;
+		}
+		}
+	}
+}
+
+int is_alphanumeric(int ascii_decimal) {
+	return (ascii_decimal >= 48 && ascii_decimal <= 57) 		// 0 to 9
+			|| (ascii_decimal >= 65 && ascii_decimal <= 89) 	// A to Z
+			|| (ascii_decimal >= 97 && ascii_decimal <= 122); 	// a to z
+}
+
+void my_memcpy(void* dst, void* src, size_t count) {
+    U8* p_dst = (U8*) dst;
+    U8* p_src = (U8*) src;
+    for (size_t i = 0; i < count; i++) {
+        p_dst[i] = p_src[i];
+    }
+}
+
+void send_putty_error(char *s, int length) {
+    for (int i = 0; i < length; ++i) {
+        SER_PutChar(1, s[i]);
+    }
+}
+
+static void reset_state(U8 *is_new_msg, U8 *is_valid_cmd, U32 *msg_length) {
+	*is_new_msg = 1;
+	*is_valid_cmd = 0;
+	*msg_length = 0;
+}
+
+static void process_KEY_IN() {
+
+}
+
+static void process_KCD_REG() {
+
+}
